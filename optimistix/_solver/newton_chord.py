@@ -56,6 +56,53 @@ class _NoAux(eqx.Module):
         return out
 
 
+def _backtracking_line_search(
+    norm: Callable[[PyTree], Scalar],
+    slope: float,
+    min_step: float,
+    decrease_factor: float,
+    step_init: float,
+    fn: Fn[Y, Out, Aux],
+    y: Y,
+    diff: Y,
+    args: PyTree,
+    fx: PyTree,
+    lower: PyTree | None,
+    upper: PyTree | None,
+) -> Y:
+    f_min = norm(fx)
+
+    def cond_fun(carry):
+        step_size, new_f, _ = carry
+        f_min_eval = norm(new_f)
+        accept = f_min_eval <= (1 - slope * step_size) * f_min
+        return jnp.invert(accept) & (step_size > min_step)
+
+    def body_fun(carry):
+        step_size, _, _ = carry
+        step_size = step_size * decrease_factor
+        new_y_loop = (y**ω - step_size * diff**ω).ω
+        if lower is not None:
+            new_y_loop = jtu.tree_map(lambda a, b: jnp.clip(a, min=b), new_y_loop, lower)
+        if upper is not None:
+            new_y_loop = jtu.tree_map(lambda a, b: jnp.clip(a, max=b), new_y_loop, upper)
+        new_f_loop, new_aux_loop = fn(new_y_loop, args)
+        return step_size, new_f_loop, new_aux_loop
+
+    init_step_size = jnp.asarray(step_init)
+    init_y = (y**ω - init_step_size * diff**ω).ω
+    if lower is not None:
+        init_y = jtu.tree_map(lambda a, b: jnp.clip(a, min=b), init_y, lower)
+    if upper is not None:
+        init_y = jtu.tree_map(lambda a, b: jnp.clip(a, max=b), init_y, upper)
+    init_f, init_aux = fn(init_y, args)
+
+    init_carry = (init_step_size, init_f, init_aux)
+    final_step_size, _, _ = jax.lax.while_loop(cond_fun, body_fun, init_carry)
+    
+    return (y**ω - final_step_size * diff**ω).ω
+
+
 class _AbstractNewtonChord(AbstractRootFinder[Y, Out, Aux, _NewtonChordState[Y]]):
     rtol: float
     atol: float
@@ -63,6 +110,11 @@ class _AbstractNewtonChord(AbstractRootFinder[Y, Out, Aux, _NewtonChordState[Y]]
     kappa: float = 1e-2
     linear_solver: lx.AbstractLinearSolver = lx.AutoLinearSolver(well_posed=None)
     cauchy_termination: bool = True
+    line_search: bool = False
+    decrease_factor: float = 0.5
+    slope: float = 0.1
+    step_init: float = 1.0
+    min_step: float = 1e-4
 
     _is_newton: AbstractClassVar[bool]
 
@@ -126,7 +178,25 @@ class _AbstractNewtonChord(AbstractRootFinder[Y, Out, Aux, _NewtonChordState[Y]]
                 jac, fx, self.linear_solver, state=linear_state, throw=False
             )
         diff = sol.value
-        new_y = (y**ω - diff**ω).ω
+
+        if self.line_search:
+            new_y = _backtracking_line_search(
+                self.norm,
+                self.slope,
+                self.min_step,
+                self.decrease_factor,
+                self.step_init,
+                fn,
+                y,
+                diff,
+                args,
+                fx,
+                lower,
+                upper,
+            )
+        else:
+            new_y = (y**ω - diff**ω).ω
+
         if lower is not None:
             new_y = jtu.tree_map(lambda a, b: jnp.clip(a, min=b), new_y, lower)
         if upper is not None:
@@ -270,6 +340,16 @@ _init_doc = """**Arguments:**
     equations with adaptive step sizing and implicit solvers. The exact procedure is as
     described in Section IV.8 of Hairer & Wanner, "Solving Ordinary Differential
     Equations II".
+- `line_search`: When `True`, employ a backtracking armijo line search to find step size.
+- `decrease_factor`: The rate at which to backtrack, i.e.
+    `next_stepsize = decrease_factor * current_stepsize`. Must be between 0 and 1.
+- `slope`: The slope of of the linear approximation to
+    `f` that the backtracking algorithm must exceed to terminate. Larger
+    means stricter termination criteria. Must be between 0 and 1.
+- `step_init`: The first `step_size` the backtracking algorithm will
+    try. Must be greater than 0.
+- `min_step`: The minimum step size to try before abandoning line search and defaulting 
+    to `min_step` as the step size. Must be greater than 0.
 """
 
 Newton.__init__.__doc__ = _init_doc
