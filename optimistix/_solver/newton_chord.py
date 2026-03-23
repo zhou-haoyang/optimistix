@@ -56,6 +56,14 @@ class _NoAux(eqx.Module):
         return out
 
 
+def _clip(y: Y, lower: PyTree | None, upper: PyTree | None) -> Y:
+    if lower is not None:
+        y = jtu.tree_map(lambda a, b: jnp.clip(a, min=b), y, lower)
+    if upper is not None:
+        y = jtu.tree_map(lambda a, b: jnp.clip(a, max=b), y, upper)
+    return y
+
+
 def _backtracking_line_search(
     norm: Callable[[PyTree], Scalar],
     slope: float,
@@ -69,38 +77,32 @@ def _backtracking_line_search(
     fx: PyTree,
     lower: PyTree | None,
     upper: PyTree | None,
-) -> Y:
+) -> (Scalar, Y, Out, Aux):
     f_min = norm(fx)
 
+    def eval_f(step_size):
+        new_y = (y**ω - step_size * diff**ω).ω
+        new_y = _clip(new_y, lower, upper)
+        new_f, new_aux = fn(new_y, args)
+        return new_y, new_f, new_aux
+
     def cond_fun(carry):
-        step_size, new_f, _ = carry
+        step_size, _, new_f, _ = carry
         f_min_eval = norm(new_f)
         accept = f_min_eval <= (1 - slope * step_size) * f_min
         return jnp.invert(accept) & (step_size > min_step)
 
     def body_fun(carry):
-        step_size, _, _ = carry
+        step_size, _, _, _ = carry
         step_size = step_size * decrease_factor
-        new_y_loop = (y**ω - step_size * diff**ω).ω
-        if lower is not None:
-            new_y_loop = jtu.tree_map(lambda a, b: jnp.clip(a, min=b), new_y_loop, lower)
-        if upper is not None:
-            new_y_loop = jtu.tree_map(lambda a, b: jnp.clip(a, max=b), new_y_loop, upper)
-        new_f_loop, new_aux_loop = fn(new_y_loop, args)
-        return step_size, new_f_loop, new_aux_loop
+        new_y_loop, new_f_loop, new_aux_loop = eval_f(step_size)
+        return step_size, new_y_loop, new_f_loop, new_aux_loop
 
     init_step_size = jnp.asarray(step_init)
-    init_y = (y**ω - init_step_size * diff**ω).ω
-    if lower is not None:
-        init_y = jtu.tree_map(lambda a, b: jnp.clip(a, min=b), init_y, lower)
-    if upper is not None:
-        init_y = jtu.tree_map(lambda a, b: jnp.clip(a, max=b), init_y, upper)
-    init_f, init_aux = fn(init_y, args)
+    init_y, init_f, init_aux = eval_f(init_step_size)
 
-    init_carry = (init_step_size, init_f, init_aux)
-    final_step_size, _, _ = jax.lax.while_loop(cond_fun, body_fun, init_carry)
-    
-    return (y**ω - final_step_size * diff**ω).ω
+    init_carry = (init_step_size, init_y, init_f, init_aux)
+    return jax.lax.while_loop(cond_fun, body_fun, init_carry)
 
 
 class _AbstractNewtonChord(AbstractRootFinder[Y, Out, Aux, _NewtonChordState[Y]]):
@@ -194,15 +196,12 @@ class _AbstractNewtonChord(AbstractRootFinder[Y, Out, Aux, _NewtonChordState[Y]]
                 lower,
                 upper,
             )
+            diff = (y**ω - new_y**ω).ω
         else:
             new_y = (y**ω - diff**ω).ω
-
-        if lower is not None:
-            new_y = jtu.tree_map(lambda a, b: jnp.clip(a, min=b), new_y, lower)
-        if upper is not None:
-            new_y = jtu.tree_map(lambda a, b: jnp.clip(a, max=b), new_y, upper)
-        if lower is not None or upper is not None:
-            diff = (y**ω - new_y**ω).ω
+            new_y = _clip(new_y, lower, upper)
+            if lower is not None or upper is not None:
+                diff = (y**ω - new_y**ω).ω
         scale = (self.atol + self.rtol * ω(new_y).call(jnp.abs)).ω
         with jax.numpy_dtype_promotion("standard"):
             diffsize = self.norm((diff**ω / scale**ω).ω)
