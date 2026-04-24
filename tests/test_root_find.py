@@ -22,6 +22,12 @@ _root_finders = (
     optx.Newton(rtol, atol),
     optx.Chord(rtol, atol),
 )
+# BacktrackingArmijo requires real-valued comparisons, so excluded from complex JVP tests.
+_root_finders_with_search = (
+    *_root_finders,
+    optx.Newton(rtol, atol, search=optx.BacktrackingArmijo()),
+    optx.Chord(rtol, atol, search=optx.BacktrackingArmijo()),
+)
 _solvers = (
     *_root_finders,
     optx.LevenbergMarquardt(rtol, atol),
@@ -29,7 +35,7 @@ _solvers = (
 smoke_aux = (jnp.ones((2, 3)), {"smoke_aux": jnp.ones(2)})
 
 
-@pytest.mark.parametrize("solver", _root_finders)
+@pytest.mark.parametrize("solver", _root_finders_with_search)
 @pytest.mark.parametrize("_fn, init, args", fixed_point_fn_init_args)
 def test_root_find(solver, _fn, init, args):
     atol = rtol = 1e-5
