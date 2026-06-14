@@ -12,7 +12,7 @@ import lineax as lx
 from equinox.internal import ω
 from jaxtyping import PyTree
 
-from ._misc import tree_full_like
+from ._misc import tree_full_like, tree_where
 
 
 def _is_global_function(x):
@@ -30,6 +30,7 @@ def implicit_jvp(
     inputs: _Inputs,
     tags: frozenset[object],
     linear_solver: lx.AbstractLinearSolver,
+    throw: bool = True,
 ):
     """Rewrites gradients via the implicit function theorem.
 
@@ -42,6 +43,11 @@ def implicit_jvp(
         `d(fn_rewrite)/d(root)`.
     - `linear_solver`: an `lx.AbstractLinearSolver`, used to solve the linear problem
         on the backward pass.
+    - `throw`: whether the backward linear solve should raise an error if it fails. If
+        `False` then a failed linear solve returns a non-finite cotangent instead of
+        raising. Note that if the primal `root` is non-finite (e.g. the forward solve
+        diverged) then -- regardless of `throw` -- the cotangent is masked at those
+        entries rather than raising; see `_implicit_impl_jvp` for details.
 
     Note that due to limitations with JAX's custom autodiff, both `fn_primal` and
     `fn_rewrite` should be global functions (i.e. they should not capture any JAX array
@@ -57,13 +63,15 @@ def implicit_jvp(
     """
     assert _is_global_function(fn_primal)
     assert _is_global_function(fn_rewrite)
-    root, residual = _implicit_impl(fn_primal, fn_rewrite, inputs, tags, linear_solver)
+    root, residual = _implicit_impl(
+        fn_primal, fn_rewrite, inputs, tags, linear_solver, throw
+    )
     return root, jtu.tree_map(eqxi.nondifferentiable_backward, residual)
 
 
 @eqx.filter_custom_jvp
-def _implicit_impl(fn_primal, fn_rewrite, inputs, tags, linear_solver):
-    del fn_rewrite, tags, linear_solver
+def _implicit_impl(fn_primal, fn_rewrite, inputs, tags, linear_solver, throw):
+    del fn_rewrite, tags, linear_solver, throw
     return jtu.tree_map(jnp.asarray, fn_primal(inputs))
 
 
@@ -82,32 +90,60 @@ def _for_jac(root, args):
 
 @_implicit_impl.def_jvp
 def _implicit_impl_jvp(primals, tangents):
-    fn_primal, fn_rewrite, inputs, tags, linear_solver = primals
+    fn_primal, fn_rewrite, inputs, tags, linear_solver, throw = primals
     (
         t_fn_primal,
         t_fn_rewrite,
         t_inputs,
         t_tags,
         t_linear_solver,
+        t_throw,
     ) = tangents
 
-    jtu.tree_map(_assert_false, (t_fn_primal, t_fn_rewrite, t_tags, t_linear_solver))
-    del t_fn_primal, t_fn_rewrite, t_tags, t_linear_solver
+    jtu.tree_map(
+        _assert_false, (t_fn_primal, t_fn_rewrite, t_tags, t_linear_solver, t_throw)
+    )
+    del t_fn_primal, t_fn_rewrite, t_tags, t_linear_solver, t_throw
     no_tangent = jtu.tree_map(_is_none, t_inputs, is_leaf=_is_none)
     nondiff, diff = eqx.partition(inputs, no_tangent, is_leaf=_is_none)
 
-    root, residual = implicit_jvp(fn_primal, fn_rewrite, inputs, tags, linear_solver)
+    root, residual = implicit_jvp(
+        fn_primal, fn_rewrite, inputs, tags, linear_solver, throw
+    )
+
+    # If the forward solve diverged then `root` is non-finite. Linearising at such a
+    # `root` would feed non-finite inputs into the cotangent linear solve -- and, under
+    # reverse-mode, into its transpose, which Lineax always solves with `throw=True`
+    # (there is nowhere to pipe a result to). So merely threading `throw` into the
+    # forward `linear_solve`, or skipping it with a `lax.cond` (which `vmap` turns into
+    # a `select` that evaluates both branches anyway), is not enough on its own.
+    #
+    # Instead we linearise at a sanitised, finite point so the linear solve always
+    # receives finite inputs and so cannot raise, and then mask the cotangent back out
+    # at the non-finite entries of `root`. (The mask uses `tree_where` rather than a
+    # multiply so that on the reverse pass a finite -- in fact zero -- cotangent is fed
+    # into the transposed solve, which would otherwise raise on a non-finite input. This
+    # does mean a diverged element contributes a zero, rather than non-finite, reverse
+    # cotangent.) The forward primal `root` is returned untouched, so the failure stays
+    # visible to the caller as a non-finite value, consistent with the forward pass. The
+    # mask is element-wise so that, under `vmap`, one diverged batch element does not
+    # taint the cotangents of the others.
+    root_finite = jtu.tree_map(jnp.isfinite, root)
+    safe_root = tree_where(root_finite, root, tree_full_like(root, 0))
 
     def _for_jvp(_diff):
         _inputs = eqx.combine(_diff, nondiff)
-        return fn_rewrite(root, residual, _inputs)
+        return fn_rewrite(safe_root, residual, _inputs)
 
     operator = lx.JacobianLinearOperator(
-        _for_jac, root, (fn_rewrite, residual, inputs), tags=tags
+        _for_jac, safe_root, (fn_rewrite, residual, inputs), tags=tags
     )
     _, jvp_diff = jax.jvp(_for_jvp, (diff,), (t_inputs,))
 
-    t_root = (-(lx.linear_solve(operator, jvp_diff, linear_solver).value ** ω)).ω
+    solved = (
+        -(lx.linear_solve(operator, jvp_diff, linear_solver, throw=throw).value ** ω)
+    ).ω
+    t_root = tree_where(root_finite, solved, tree_full_like(root, jnp.nan))
     if hasattr(jax.custom_derivatives, "zero_from_primal"):
         t_residual = jax.custom_derivatives.zero_from_primal(  # pyright: ignore[reportGeneralTypeIssues]
             residual, symbolic_zeros=True

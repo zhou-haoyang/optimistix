@@ -20,10 +20,16 @@ class AbstractAdjoint(eqx.Module):
         rewrite_fn: Callable,
         inputs: PyTree,
         tags: frozenset[object],
+        throw: bool,
     ) -> PyTree[Array]:
         """Runs the main solver loop. Subclasses can override this to provide custom
         autodifferentiation behaviour; see for example the implementation of
         [`optimistix.ImplicitAdjoint`][].
+
+        `throw` indicates whether the solve should raise an error on failure. Adjoints
+        that perform their own (e.g. linear) solves on the backward pass should
+        propagate this, so that the cotangent pass honours `throw` in the same way as
+        the forward pass.
         """
 
 
@@ -105,8 +111,8 @@ class RecursiveCheckpointAdjoint(AbstractAdjoint):
 
     checkpoints: int | None = None
 
-    def apply(self, primal_fn, rewrite_fn, inputs, tags):
-        del rewrite_fn, tags
+    def apply(self, primal_fn, rewrite_fn, inputs, tags, throw):
+        del rewrite_fn, tags, throw
         while_loop = ft.partial(
             eqxi.while_loop, kind="checkpointed", checkpoints=self.checkpoints
         )
@@ -128,9 +134,11 @@ class ImplicitAdjoint(AbstractAdjoint):
 
     linear_solver: lx.AbstractLinearSolver = lx.AutoLinearSolver(well_posed=None)
 
-    def apply(self, primal_fn, rewrite_fn, inputs, tags):
+    def apply(self, primal_fn, rewrite_fn, inputs, tags, throw):
         inputs = inputs + (ft.partial(eqxi.while_loop, kind="lax"),)
-        return implicit_jvp(primal_fn, rewrite_fn, inputs, tags, self.linear_solver)
+        return implicit_jvp(
+            primal_fn, rewrite_fn, inputs, tags, self.linear_solver, throw
+        )
 
 
 RecursiveCheckpointAdjoint.__init__.__doc__ = """**Arguments:**

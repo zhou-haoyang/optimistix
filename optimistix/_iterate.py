@@ -350,7 +350,7 @@ def iterative_solve(
             aux,
             stats,
         ),
-    ) = adjoint.apply(_iterate, rewrite_fn, inputs, tags)
+    ) = adjoint.apply(_iterate, rewrite_fn, inputs, tags, throw)
     final_state = eqx.combine(dynamic_final_state, unwrap_jaxpr(static_state.value))
     stats = {"num_steps": num_steps, "max_steps": max_steps, **stats}
     sol = Solution(value=out, result=result, state=final_state, aux=aux, stats=stats)

@@ -873,8 +873,8 @@ fixed_point_fn_init_args = (
 
 # Not really useful enough to be part of the public API, but useful for testing against.
 class PiggybackAdjoint(optx.AbstractAdjoint):
-    def apply(self, primal_fn, rewrite_fn, inputs, tags):
-        del rewrite_fn, tags
+    def apply(self, primal_fn, rewrite_fn, inputs, tags, throw):
+        del rewrite_fn, tags, throw
         while_loop = ft.partial(eqxi.while_loop, kind="lax")
         return primal_fn(inputs + (while_loop,))
 
